@@ -8,6 +8,11 @@ messages.py — Gorgias /messages extractor (Cursor Only - Full Production Versi
   - Full Error Handling (4xx/5xx)
   - DynamoDB Leases & Checkpointing
   - Detailed Logging
+  
+FIXES APPLIED:
+- _ddb_done() now PRESERVES cursor instead of deleting it
+- _ddb_checkpoint() has preserve_cursor parameter
+- This allows hourly jobs to resume from last position
 """
 
 import os
@@ -181,81 +186,121 @@ def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
             return
         raise
 
+
+# -------------------- FIXED: _ddb_checkpoint --------------------
 def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str],
-                    note: str = "", last_error: str = "", lease_owner: Optional[str] = None) -> None:
+                    note: str = "", last_error: str = "", lease_owner: Optional[str] = None,
+                    preserve_cursor: bool = False) -> None:
+    """
+    Checkpoint the current state to DynamoDB.
+    
+    Args:
+        job_start_id: The job identifier
+        status: Job status (RUNNING, DONE, ERROR)
+        page: Current page number
+        cursor: Current cursor value
+        note: Optional note for debugging
+        last_error: Error message if any
+        lease_owner: Request ID that owns the lease
+        preserve_cursor: If True, do NOT remove cursor even if cursor param is None.
+                        This is used when we want to mark DONE but keep the cursor for resume.
+    """
     now = _utc_now_ts()
 
-    # 1. Build the SET part
-    set_actions = [
-        "#status=:s", 
-        "#page=:p", 
-        "#updated_at=:now", 
-        "in_flight=:f", 
-        "#lease_until=:z"
+    # 1. Build SET actions
+    set_parts = [
+        "#status=:s", "#page=:p", "#updated_at=:now", 
+        "in_flight=:f", "#lease_until=:z"
     ]
     names = {
-        "#status": "status", 
-        "#page": "page", 
-        "#updated_at": "updated_at", 
+        "#status": "status", "#page": "page", "#updated_at": "updated_at",
         "#lease_until": "lease_until"
     }
     vals = {
-        ":s": status, 
-        ":p": page, 
-        ":now": now, 
-        ":f": False, 
-        ":z": 0
+        ":s": status, ":p": page, ":now": now, 
+        ":f": False, ":z": 0
     }
 
     if cursor:
-        set_actions.append("#cursor=:c")
+        set_parts.append("#cursor=:c")
         names["#cursor"] = "cursor"
         vals[":c"] = cursor
     
     if note:
-        set_actions.append("#note=:n")
+        set_parts.append("#note=:n")
         names["#note"] = "note"
         vals[":n"] = note[:2000]
 
     if last_error:
-        set_actions.append("#last_error=:e")
+        set_parts.append("#last_error=:e")
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
 
-    # 2. Build the REMOVE part
-    remove_actions = []
-    if not cursor:
-        remove_actions.append("#cursor")
+    # 2. Build REMOVE actions
+    remove_parts = []
+    
+    # KEY FIX: Only remove cursor if explicitly not preserving AND cursor is None
+    if not cursor and not preserve_cursor:
+        remove_parts.append("#cursor")
         names["#cursor"] = "cursor"
     
     if lease_owner:
-        remove_actions.append("#lease_owner")
+        remove_parts.append("#lease_owner")
         names["#lease_owner"] = "lease_owner"
         vals[":me"] = lease_owner
 
-    # 3. Combine into one expression
-    update_expr = "SET " + ", ".join(set_actions)
-    if remove_actions:
-        update_expr += " REMOVE " + ", ".join(remove_actions)
+    # 3. Construct Expression
+    expr = "SET " + ", ".join(set_parts)
+    if remove_parts:
+        expr += " REMOVE " + ", ".join(remove_parts)
 
-    # 4. Execute
-    update_params = {
+    # 4. Update
+    params = {
         "Key": {"job_start_id": job_start_id},
-        "UpdateExpression": update_expr,
+        "UpdateExpression": expr,
         "ExpressionAttributeNames": names,
         "ExpressionAttributeValues": vals,
     }
-
     if lease_owner:
-        update_params["ConditionExpression"] = "attribute_not_exists(#lease_owner) OR #lease_owner = :me"
+        params["ConditionExpression"] = "attribute_not_exists(#lease_owner) OR #lease_owner = :me"
 
-    TABLE.update_item(**update_params)
+    TABLE.update_item(**params)
 
-def _ddb_done(job_start_id: str, note: str = "") -> None:
-    _ddb_checkpoint(job_start_id, "DONE", page=0, cursor=None, note=note, last_error="")
+
+# -------------------- FIXED: _ddb_done --------------------
+def _ddb_done(job_start_id: str, note: str = "", last_cursor: Optional[str] = None) -> None:
+    """
+    Mark the job as DONE but PRESERVE the cursor so hourly refresh can continue.
+    
+    For hourly jobs: We want to keep the cursor so next hour we can check for new data.
+    For daily jobs: Cursor doesn't matter, but preserving it doesn't hurt.
+    
+    Args:
+        job_start_id: The job identifier
+        note: Optional note for debugging
+        last_cursor: The last valid cursor to preserve. If None, will try to get from current state.
+    """
+    # Get current state to preserve cursor if not provided
+    if last_cursor is None:
+        state = _ddb_get(job_start_id)
+        if state:
+            last_cursor = state.get("cursor")
+    
+    _ddb_checkpoint(
+        job_start_id, 
+        status="DONE", 
+        page=0,  # Page doesn't matter for DONE status
+        cursor=last_cursor,  # PRESERVE the cursor!
+        note=note, 
+        last_error="",
+        preserve_cursor=True  # KEY: Tell checkpoint to not delete cursor
+    )
+    logger.info(f"[{STREAM_NAME}] Marked DONE, preserved cursor={'yes' if last_cursor else 'no'}")
+
 
 def _ddb_error(job_start_id: str, page: int, cursor: Optional[str], err: str) -> None:
     _ddb_checkpoint(job_start_id, "ERROR", page=page, cursor=cursor, note="error", last_error=err)
+
 
 # -------------------- API Fetcher --------------------
 def _request_with_backoff(session: requests.Session, method: str, url: str, params: Dict[str, Any], auth: Tuple[str, str], bearer_key: str) -> requests.Response:
@@ -336,6 +381,7 @@ def _fetch_page(session, cursor):
     
     return items, next_cursor, headers
 
+
 # -------------------- Main Handler --------------------
 def handler(event, context):
     request_id = getattr(context, "aws_request_id", "no_context")
@@ -391,6 +437,7 @@ def handler(event, context):
     processed = 0
     total_written = 0
     session = requests.Session()
+    last_valid_cursor = cursor  # Track the last cursor we had
     
     try:
         while processed < PAGES_PER_INVOCATION and _time_left_ok(context):
@@ -406,21 +453,24 @@ def handler(event, context):
                 return {"ok": True, "done": False, "reason": "transient_error"}
 
             if not items:
-                _ddb_done(job_start_id, "completed (no items)")
-                return {"ok": True, "done": True}
+                # FIXED: No more items - we've caught up. Mark DONE but PRESERVE cursor.
+                _ddb_done(job_start_id, "caught up (no new items)", last_cursor=last_valid_cursor)
+                return {"ok": True, "done": True, "reason": "caught_up"}
 
             # Write ALL items (Cursor logic = simple pagination)
             _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
             total_written += len(items)
 
             processed += 1
+            last_valid_cursor = cursor  # Save current cursor before moving
             cursor = next_cursor
             page += 1
 
-            # Stop condition: No more pages from API
+            # FIXED: Stop condition - No more pages from API
             if not cursor:
-                _ddb_done(job_start_id, "completed (end of stream)")
-                return {"ok": True, "done": True}
+                # Reached the end - mark DONE but preserve the LAST VALID cursor
+                _ddb_done(job_start_id, "completed (end of stream)", last_cursor=last_valid_cursor)
+                return {"ok": True, "done": True, "reason": "end_of_stream"}
 
             # Checkpoint
             if processed % CHECKPOINT_EVERY_PAGES == 0:
