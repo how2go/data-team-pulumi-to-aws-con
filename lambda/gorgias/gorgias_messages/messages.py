@@ -1,10 +1,16 @@
 """
-messages.py — Gorgias /messages extractor (Time-Based Incremental)
+messages.py — Gorgias /messages extractor (Last ID Tracking)
 
-MAJOR CHANGE: Instead of relying on cursor (which points to old data),
-we now use time-based filtering to fetch only recent messages.
+Strategy: 
+- Gorgias API returns messages in a consistent order
+- We track the LAST MESSAGE ID we've successfully processed
+- Each run: fetch from beginning, skip messages we've already seen (id <= last_seen_id)
+- Write only NEW messages (id > last_seen_id)
+- Update last_seen_id after each successful write
 
-Each run fetches messages from the last 2 hours to ensure we catch everything.
+This handles the fact that Gorgias /messages API:
+- Does NOT support date filtering
+- Cursors are pagination pointers, not bookmarks for "new data"
 """
 
 import os
@@ -12,7 +18,7 @@ import json
 import time
 import random
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
@@ -38,9 +44,6 @@ ENDPOINT = "/messages"
 
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "50"))
-
-# Time window for incremental fetches (in hours)
-LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "2"))
 
 # Rate limit + retries
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
@@ -72,13 +75,6 @@ def _utc_now_ts() -> int:
 
 def _utc_today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def _hours_ago_iso(hours: int) -> str:
-    dt = datetime.now(timezone.utc) - timedelta(hours=hours)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _safe_json_loads(s: str) -> Any:
     try:
@@ -141,12 +137,12 @@ def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[
     if not records:
         return ""
     dt = _utc_today_str()
-    # Include run timestamp to avoid overwriting files from different runs
     key = f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/run={run_ts}/page={page:06d}.json"
     body = "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records)
     _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
     return key
+
 
 # -------------------- DDB State / Lease --------------------
 def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]:
@@ -191,9 +187,9 @@ def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
 
 
 def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str],
-                    note: str = "", last_error: str = "", lease_owner: Optional[str] = None,
-                    last_fetch_time: Optional[str] = None) -> None:
-    """Checkpoint the current state to DynamoDB."""
+                    last_seen_id: Optional[int] = None, note: str = "", 
+                    last_error: str = "") -> None:
+    """Checkpoint state to DynamoDB, including last_seen_id for incremental tracking."""
     now = _utc_now_ts()
 
     set_parts = [
@@ -214,6 +210,11 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
         names["#cursor"] = "cursor"
         vals[":c"] = cursor
     
+    if last_seen_id is not None:
+        set_parts.append("#last_seen_id=:lsi")
+        names["#last_seen_id"] = "last_seen_id"
+        vals[":lsi"] = last_seen_id
+    
     if note:
         set_parts.append("#note=:n")
         names["#note"] = "note"
@@ -224,45 +225,32 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
 
-    if last_fetch_time:
-        set_parts.append("#last_fetch_time=:lft")
-        names["#last_fetch_time"] = "last_fetch_time"
-        vals[":lft"] = last_fetch_time
-
-    remove_parts = []
-    if lease_owner:
-        remove_parts.append("#lease_owner")
-        names["#lease_owner"] = "lease_owner"
-        vals[":me"] = lease_owner
+    remove_parts = ["#lease_owner"]
+    names["#lease_owner"] = "lease_owner"
 
     expr = "SET " + ", ".join(set_parts)
     if remove_parts:
         expr += " REMOVE " + ", ".join(remove_parts)
 
-    params = {
-        "Key": {"job_start_id": job_start_id},
-        "UpdateExpression": expr,
-        "ExpressionAttributeNames": names,
-        "ExpressionAttributeValues": vals,
-    }
-    if lease_owner:
-        params["ConditionExpression"] = "attribute_not_exists(#lease_owner) OR #lease_owner = :me"
-
-    TABLE.update_item(**params)
+    TABLE.update_item(
+        Key={"job_start_id": job_start_id},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=vals,
+    )
 
 
-def _ddb_done(job_start_id: str, note: str = "", last_fetch_time: Optional[str] = None) -> None:
-    """Mark the job as DONE and record when we last fetched."""
+def _ddb_done(job_start_id: str, last_seen_id: int, note: str = "") -> None:
+    """Mark job as DONE and save the last_seen_id for next run."""
     _ddb_checkpoint(
         job_start_id, 
         status="DONE", 
         page=0,
         cursor=None,
-        note=note, 
-        last_error="",
-        last_fetch_time=last_fetch_time
+        last_seen_id=last_seen_id,
+        note=note
     )
-    logger.info(f"[{STREAM_NAME}] Marked DONE, last_fetch_time={last_fetch_time}")
+    logger.info(f"[{STREAM_NAME}] Marked DONE, last_seen_id={last_seen_id}")
 
 
 def _ddb_error(job_start_id: str, page: int, cursor: Optional[str], err: str) -> None:
@@ -270,7 +258,9 @@ def _ddb_error(job_start_id: str, page: int, cursor: Optional[str], err: str) ->
 
 
 # -------------------- API Fetcher --------------------
-def _request_with_backoff(session: requests.Session, method: str, url: str, params: Dict[str, Any], auth: Tuple[str, str], bearer_key: str) -> requests.Response:
+def _request_with_backoff(session: requests.Session, method: str, url: str, 
+                          params: Dict[str, Any], auth: Tuple[str, str], 
+                          bearer_key: str) -> requests.Response:
     backoff = BACKOFF_BASE_SECONDS
     last_resp = None
 
@@ -280,19 +270,14 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
             last_resp = r
             
             if r.status_code == 401:
-                r = session.request(method, url, params=params, headers={"Authorization": f"Bearer {bearer_key}"}, timeout=REQUEST_TIMEOUT)
+                r = session.request(method, url, params=params, 
+                                   headers={"Authorization": f"Bearer {bearer_key}"}, 
+                                   timeout=REQUEST_TIMEOUT)
                 last_resp = r
 
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        sleep_s = float(retry_after)
-                    except:
-                        sleep_s = backoff
-                else:
-                    sleep_s = backoff + random.random()
-                
+                sleep_s = float(retry_after) if retry_after else backoff + random.random()
                 logger.warning(f"[{STREAM_NAME}] 429 rate limited. attempt={attempt}. sleeping {sleep_s:.2f}s")
                 time.sleep(sleep_s)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
@@ -319,27 +304,18 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
     raise RuntimeError(f"Exceeded max retries. Last status: {last_resp.status_code if last_resp else 'None'}")
 
 
-def _fetch_page(session, cursor: Optional[str], since_datetime: str):
-    """
-    Fetches a single page of messages.
-    Uses time-based filtering to only get recent messages.
-    """
+def _fetch_page(session, cursor: Optional[str]):
+    """Fetch a page of messages using cursor pagination."""
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
     
-    params = {
-        "limit": PAGE_SIZE,
-        "order_by": "created_datetime:asc",  # Get oldest first within window
-    }
-    
-    # Always filter by time - this is the KEY change
-    params["created_datetime[gte]"] = since_datetime
-    
-    # Use cursor for pagination within the time window
+    # Simple params - no date filtering (API doesn't support it)
+    params = {"limit": PAGE_SIZE}
     if cursor:
         params["cursor"] = cursor
 
-    logger.info(f"[{STREAM_NAME}] Fetching since={since_datetime} cursor={cursor[:30] if cursor else 'START'}...")
+    short_cursor = cursor[:30] if cursor else "START"
+    logger.info(f"[{STREAM_NAME}] Fetching cursor={short_cursor}...")
 
     r = _request_with_backoff(session, "GET", url, params, (email, api_key), api_key)
     headers = dict(r.headers)
@@ -393,61 +369,87 @@ def handler(event, context):
 
     logger.info(f"[{STREAM_NAME}] Lease acquired")
 
-    # Calculate time window for fetching
-    # Always look back LOOKBACK_HOURS to catch any messages we might have missed
-    since_datetime = _hours_ago_iso(LOOKBACK_HOURS)
-    current_time = _utc_now_iso()
-    
-    logger.info(f"[{STREAM_NAME}] Fetching messages since {since_datetime}")
+    # Get last_seen_id from state - this is the KEY for incremental fetching
+    last_seen_id = int(state.get("last_seen_id", 0) or 0)
+    logger.info(f"[{STREAM_NAME}] Last seen message ID: {last_seen_id}")
 
-    # For time-based fetching, we always start fresh with no cursor
-    # The cursor is only used for pagination within a single run
+    # Always start from the beginning (no cursor) to scan for new messages
+    # We'll filter by ID to only process new ones
     cursor = None
     page = 1
     
-    processed = 0
+    processed_pages = 0
     total_written = 0
+    max_id_this_run = last_seen_id
     session = requests.Session()
+    consecutive_old_pages = 0  # Track pages with no new messages
     
     try:
-        while processed < PAGES_PER_INVOCATION and _time_left_ok(context):
-            if processed > 0 and processed % LEASE_RENEW_EVERY_PAGES == 0:
+        while processed_pages < PAGES_PER_INVOCATION and _time_left_ok(context):
+            if processed_pages > 0 and processed_pages % LEASE_RENEW_EVERY_PAGES == 0:
                 _ddb_renew_lease(job_start_id, request_id)
 
             try:
-                items, next_cursor, headers = _fetch_page(session, cursor, since_datetime)
+                items, next_cursor, headers = _fetch_page(session, cursor)
             except RuntimeError as e:
                 msg = str(e)
                 logger.warning(f"[{STREAM_NAME}] Transient failure: {msg}")
-                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused: {msg}")
+                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, 
+                               last_seen_id=max_id_this_run, note=f"paused: {msg}")
                 return {"ok": True, "done": False, "reason": "transient_error"}
 
             if not items:
-                # No more messages in time window - we're done
-                _ddb_done(job_start_id, f"completed - fetched {total_written} messages since {since_datetime}", last_fetch_time=current_time)
-                return {"ok": True, "done": True, "reason": "no_more_messages", "total_written": total_written}
+                # No more messages at all
+                _ddb_done(job_start_id, max_id_this_run, 
+                         f"completed - wrote {total_written} new messages")
+                return {"ok": True, "done": True, "total_written": total_written}
 
-            # Write items
-            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items, run_ts)
-            total_written += len(items)
+            # Filter to only NEW messages (id > last_seen_id)
+            new_messages = [m for m in items if int(m.get("id", 0)) > last_seen_id]
+            
+            # Track the max ID we've seen
+            for m in items:
+                msg_id = int(m.get("id", 0))
+                if msg_id > max_id_this_run:
+                    max_id_this_run = msg_id
 
-            processed += 1
+            if new_messages:
+                # Write only the new messages
+                _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, new_messages, run_ts)
+                total_written += len(new_messages)
+                consecutive_old_pages = 0
+                page += 1
+            else:
+                consecutive_old_pages += 1
+                logger.info(f"[{STREAM_NAME}] Page had 0 new messages (all IDs <= {last_seen_id})")
+
+            processed_pages += 1
             cursor = next_cursor
-            page += 1
+
+            # If we've seen 3 consecutive pages with no new messages, we're caught up
+            if consecutive_old_pages >= 3:
+                logger.info(f"[{STREAM_NAME}] 3 consecutive pages with no new messages - caught up")
+                _ddb_done(job_start_id, max_id_this_run, 
+                         f"caught up - wrote {total_written} new messages")
+                return {"ok": True, "done": True, "total_written": total_written}
 
             # No more pages
             if not cursor:
-                _ddb_done(job_start_id, f"completed - fetched {total_written} messages since {since_datetime}", last_fetch_time=current_time)
-                return {"ok": True, "done": True, "reason": "end_of_results", "total_written": total_written}
+                _ddb_done(job_start_id, max_id_this_run, 
+                         f"end of stream - wrote {total_written} new messages")
+                return {"ok": True, "done": True, "total_written": total_written}
 
-            # Checkpoint
-            if processed % CHECKPOINT_EVERY_PAGES == 0:
-                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"page {page}, wrote {total_written}")
-                logger.info(f"[{STREAM_NAME}] Checkpoint at page {page}")
+            # Checkpoint periodically
+            if processed_pages % CHECKPOINT_EVERY_PAGES == 0:
+                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor,
+                               last_seen_id=max_id_this_run, 
+                               note=f"page {page}, wrote {total_written}")
+                logger.info(f"[{STREAM_NAME}] Checkpoint at page {page}, max_id={max_id_this_run}")
 
-        # Pausing (time/page limit)
+        # Pausing due to time/page limit
         logger.info(f"[{STREAM_NAME}] Pausing at page {page} (wrote {total_written} this run)")
-        _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused at page {page}")
+        _ddb_checkpoint(job_start_id, "RUNNING", page, cursor,
+                       last_seen_id=max_id_this_run, note=f"paused at page {page}")
         return {"ok": True, "done": False, "total_written": total_written}
 
     except Exception as e:
