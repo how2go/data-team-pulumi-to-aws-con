@@ -1,18 +1,10 @@
 """
-messages.py — Gorgias /messages extractor (Cursor Only - Full Production Version)
+messages.py — Gorgias /messages extractor (Time-Based Incremental)
 
-- Method: GET (Standard for /messages)
-- Logic: Cursor-based pagination (Start -> End).
-- Features:
-  - Robust Rate Limiting (429 handling with Jitter)
-  - Full Error Handling (4xx/5xx)
-  - DynamoDB Leases & Checkpointing
-  - Detailed Logging
-  
-FIXES APPLIED:
-- _ddb_done() now PRESERVES cursor instead of deleting it
-- _ddb_checkpoint() has preserve_cursor parameter
-- This allows hourly jobs to resume from last position
+MAJOR CHANGE: Instead of relying on cursor (which points to old data),
+we now use time-based filtering to fetch only recent messages.
+
+Each run fetches messages from the last 2 hours to ensure we catch everything.
 """
 
 import os
@@ -20,7 +12,7 @@ import json
 import time
 import random
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
@@ -46,6 +38,9 @@ ENDPOINT = "/messages"
 
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "50"))
+
+# Time window for incremental fetches (in hours)
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "2"))
 
 # Rate limit + retries
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
@@ -77,6 +72,13 @@ def _utc_now_ts() -> int:
 
 def _utc_today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _hours_ago_iso(hours: int) -> str:
+    dt = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _safe_json_loads(s: str) -> Any:
     try:
@@ -135,11 +137,12 @@ def _throttle_on_success(headers: Dict[str, str]) -> None:
     if sleep_s > 0:
         time.sleep(sleep_s)
 
-def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]]) -> str:
+def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]], run_ts: str) -> str:
     if not records:
         return ""
     dt = _utc_today_str()
-    key = f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/page={page:06d}.json"
+    # Include run timestamp to avoid overwriting files from different runs
+    key = f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/run={run_ts}/page={page:06d}.json"
     body = "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records)
     _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
@@ -187,27 +190,12 @@ def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
         raise
 
 
-# -------------------- FIXED: _ddb_checkpoint --------------------
 def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str],
                     note: str = "", last_error: str = "", lease_owner: Optional[str] = None,
-                    preserve_cursor: bool = False) -> None:
-    """
-    Checkpoint the current state to DynamoDB.
-    
-    Args:
-        job_start_id: The job identifier
-        status: Job status (RUNNING, DONE, ERROR)
-        page: Current page number
-        cursor: Current cursor value
-        note: Optional note for debugging
-        last_error: Error message if any
-        lease_owner: Request ID that owns the lease
-        preserve_cursor: If True, do NOT remove cursor even if cursor param is None.
-                        This is used when we want to mark DONE but keep the cursor for resume.
-    """
+                    last_fetch_time: Optional[str] = None) -> None:
+    """Checkpoint the current state to DynamoDB."""
     now = _utc_now_ts()
 
-    # 1. Build SET actions
     set_parts = [
         "#status=:s", "#page=:p", "#updated_at=:now", 
         "in_flight=:f", "#lease_until=:z"
@@ -236,25 +224,21 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
 
-    # 2. Build REMOVE actions
+    if last_fetch_time:
+        set_parts.append("#last_fetch_time=:lft")
+        names["#last_fetch_time"] = "last_fetch_time"
+        vals[":lft"] = last_fetch_time
+
     remove_parts = []
-    
-    # KEY FIX: Only remove cursor if explicitly not preserving AND cursor is None
-    if not cursor and not preserve_cursor:
-        remove_parts.append("#cursor")
-        names["#cursor"] = "cursor"
-    
     if lease_owner:
         remove_parts.append("#lease_owner")
         names["#lease_owner"] = "lease_owner"
         vals[":me"] = lease_owner
 
-    # 3. Construct Expression
     expr = "SET " + ", ".join(set_parts)
     if remove_parts:
         expr += " REMOVE " + ", ".join(remove_parts)
 
-    # 4. Update
     params = {
         "Key": {"job_start_id": job_start_id},
         "UpdateExpression": expr,
@@ -267,35 +251,18 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
     TABLE.update_item(**params)
 
 
-# -------------------- FIXED: _ddb_done --------------------
-def _ddb_done(job_start_id: str, note: str = "", last_cursor: Optional[str] = None) -> None:
-    """
-    Mark the job as DONE but PRESERVE the cursor so hourly refresh can continue.
-    
-    For hourly jobs: We want to keep the cursor so next hour we can check for new data.
-    For daily jobs: Cursor doesn't matter, but preserving it doesn't hurt.
-    
-    Args:
-        job_start_id: The job identifier
-        note: Optional note for debugging
-        last_cursor: The last valid cursor to preserve. If None, will try to get from current state.
-    """
-    # Get current state to preserve cursor if not provided
-    if last_cursor is None:
-        state = _ddb_get(job_start_id)
-        if state:
-            last_cursor = state.get("cursor")
-    
+def _ddb_done(job_start_id: str, note: str = "", last_fetch_time: Optional[str] = None) -> None:
+    """Mark the job as DONE and record when we last fetched."""
     _ddb_checkpoint(
         job_start_id, 
         status="DONE", 
-        page=0,  # Page doesn't matter for DONE status
-        cursor=last_cursor,  # PRESERVE the cursor!
+        page=0,
+        cursor=None,
         note=note, 
         last_error="",
-        preserve_cursor=True  # KEY: Tell checkpoint to not delete cursor
+        last_fetch_time=last_fetch_time
     )
-    logger.info(f"[{STREAM_NAME}] Marked DONE, preserved cursor={'yes' if last_cursor else 'no'}")
+    logger.info(f"[{STREAM_NAME}] Marked DONE, last_fetch_time={last_fetch_time}")
 
 
 def _ddb_error(job_start_id: str, page: int, cursor: Optional[str], err: str) -> None:
@@ -312,12 +279,10 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
             r = session.request(method, url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
             last_resp = r
             
-            # 1. Auth Retry
             if r.status_code == 401:
                 r = session.request(method, url, params=params, headers={"Authorization": f"Bearer {bearer_key}"}, timeout=REQUEST_TIMEOUT)
                 last_resp = r
 
-            # 2. Rate Limit
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
@@ -333,7 +298,6 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
                 continue
             
-            # 3. Server Errors
             if r.status_code >= 500:
                 sleep_s = backoff + random.random()
                 logger.warning(f"[{STREAM_NAME}] {r.status_code} server error. attempt={attempt}. sleeping {sleep_s:.2f}s")
@@ -341,7 +305,6 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
                 continue
             
-            # 4. Client Errors (400) -> Raise to stop
             if r.status_code >= 400:
                 logger.error(f"[{STREAM_NAME}] API Error {r.status_code}: {r.text[:500]}")
                 r.raise_for_status()
@@ -355,19 +318,28 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
 
     raise RuntimeError(f"Exceeded max retries. Last status: {last_resp.status_code if last_resp else 'None'}")
 
-def _fetch_page(session, cursor):
+
+def _fetch_page(session, cursor: Optional[str], since_datetime: str):
     """
     Fetches a single page of messages.
-    Logic: Uses cursor + limit. NO order_by (API default).
+    Uses time-based filtering to only get recent messages.
     """
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
     
-    params = {"limit": PAGE_SIZE}
+    params = {
+        "limit": PAGE_SIZE,
+        "order_by": "created_datetime:asc",  # Get oldest first within window
+    }
+    
+    # Always filter by time - this is the KEY change
+    params["created_datetime[gte]"] = since_datetime
+    
+    # Use cursor for pagination within the time window
     if cursor:
         params["cursor"] = cursor
 
-    logger.info(f"[{STREAM_NAME}] Fetching cursor={cursor[:30] if cursor else 'START'}...")
+    logger.info(f"[{STREAM_NAME}] Fetching since={since_datetime} cursor={cursor[:30] if cursor else 'START'}...")
 
     r = _request_with_backoff(session, "GET", url, params, (email, api_key), api_key)
     headers = dict(r.headers)
@@ -385,7 +357,8 @@ def _fetch_page(session, cursor):
 # -------------------- Main Handler --------------------
 def handler(event, context):
     request_id = getattr(context, "aws_request_id", "no_context")
-    logger.info(f"[{STREAM_NAME}] START request_id={request_id}")
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    logger.info(f"[{STREAM_NAME}] START request_id={request_id} run_ts={run_ts}")
     
     # Parse input
     record = (event.get("Records") or [None])[0] if isinstance(event, dict) else None
@@ -420,24 +393,21 @@ def handler(event, context):
 
     logger.info(f"[{STREAM_NAME}] Lease acquired")
 
+    # Calculate time window for fetching
+    # Always look back LOOKBACK_HOURS to catch any messages we might have missed
+    since_datetime = _hours_ago_iso(LOOKBACK_HOURS)
+    current_time = _utc_now_iso()
+    
+    logger.info(f"[{STREAM_NAME}] Fetching messages since {since_datetime}")
 
-    # Prepare for Loop — DDB IS SOURCE OF TRUTH
-    cursor = state.get("cursor")
-    if cursor == "":
-        cursor = None
-
-    page = int(state.get("page") or 1)
-
-    # ONLY allow override for explicit manual replay
-    if body.get("force_override"):
-        cursor = body.get("cursor") or cursor
-        page = int(body.get("page") or page)
-
+    # For time-based fetching, we always start fresh with no cursor
+    # The cursor is only used for pagination within a single run
+    cursor = None
+    page = 1
     
     processed = 0
     total_written = 0
     session = requests.Session()
-    last_valid_cursor = cursor  # Track the last cursor we had
     
     try:
         while processed < PAGES_PER_INVOCATION and _time_left_ok(context):
@@ -445,7 +415,7 @@ def handler(event, context):
                 _ddb_renew_lease(job_start_id, request_id)
 
             try:
-                items, next_cursor, headers = _fetch_page(session, cursor)
+                items, next_cursor, headers = _fetch_page(session, cursor, since_datetime)
             except RuntimeError as e:
                 msg = str(e)
                 logger.warning(f"[{STREAM_NAME}] Transient failure: {msg}")
@@ -453,24 +423,22 @@ def handler(event, context):
                 return {"ok": True, "done": False, "reason": "transient_error"}
 
             if not items:
-                # FIXED: No more items - we've caught up. Mark DONE but PRESERVE cursor.
-                _ddb_done(job_start_id, "caught up (no new items)", last_cursor=last_valid_cursor)
-                return {"ok": True, "done": True, "reason": "caught_up"}
+                # No more messages in time window - we're done
+                _ddb_done(job_start_id, f"completed - fetched {total_written} messages since {since_datetime}", last_fetch_time=current_time)
+                return {"ok": True, "done": True, "reason": "no_more_messages", "total_written": total_written}
 
-            # Write ALL items (Cursor logic = simple pagination)
-            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
+            # Write items
+            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items, run_ts)
             total_written += len(items)
 
             processed += 1
-            last_valid_cursor = cursor  # Save current cursor before moving
             cursor = next_cursor
             page += 1
 
-            # FIXED: Stop condition - No more pages from API
+            # No more pages
             if not cursor:
-                # Reached the end - mark DONE but preserve the LAST VALID cursor
-                _ddb_done(job_start_id, "completed (end of stream)", last_cursor=last_valid_cursor)
-                return {"ok": True, "done": True, "reason": "end_of_stream"}
+                _ddb_done(job_start_id, f"completed - fetched {total_written} messages since {since_datetime}", last_fetch_time=current_time)
+                return {"ok": True, "done": True, "reason": "end_of_results", "total_written": total_written}
 
             # Checkpoint
             if processed % CHECKPOINT_EVERY_PAGES == 0:
@@ -480,7 +448,7 @@ def handler(event, context):
         # Pausing (time/page limit)
         logger.info(f"[{STREAM_NAME}] Pausing at page {page} (wrote {total_written} this run)")
         _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused at page {page}")
-        return {"ok": True, "done": False}
+        return {"ok": True, "done": False, "total_written": total_written}
 
     except Exception as e:
         logger.exception(f"[{STREAM_NAME}] Fatal Error")
