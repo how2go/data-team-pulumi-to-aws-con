@@ -86,6 +86,7 @@ trends_queue = aws.sqs.Queue(
 # Dispatcher layer: contains snowflake-connector-python + cryptography
 dispatcher_deps_layer = aws.lambda_.LayerVersion(
     "dispatcher-deps-layer",
+    layer_name="google-trends-dispatcher-deps",
     compatible_runtimes=["python3.11"],
     code=pulumi.FileArchive("./lambda_layer_dispatcher"),
 )
@@ -93,6 +94,7 @@ dispatcher_deps_layer = aws.lambda_.LayerVersion(
 # Worker layer: contains pandas/numpy/requests/snowflake/cryptography (you will build this)
 worker_deps_layer = aws.lambda_.LayerVersion(
     "worker-deps-layer",
+    layer_name="google-trends-worker-deps",
     compatible_runtimes=["python3.11"],
     code=pulumi.FileArchive("./lambda_layer_worker"),
 )
