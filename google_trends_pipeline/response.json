@@ -1,1 +1,1 @@
-{"errorMessage": "Unable to import module 'dispatcher': No module named 'pandas'", "errorType": "Runtime.ImportModuleError", "requestId": "", "stackTrace": []}
+{"errorMessage": "Unable to import module 'dispatcher': No module named 'snowflake'", "errorType": "Runtime.ImportModuleError", "requestId": "", "stackTrace": []}

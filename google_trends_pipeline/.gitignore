@@ -4,3 +4,5 @@ lambda_layer/
 layer.zip
 *.pyc
 .env
+lambda_layer_dispatcher/
+lambda_layer_worker/
