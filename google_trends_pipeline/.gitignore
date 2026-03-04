@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+lambda_layer/
+layer.zip
+*.pyc
+.env
