@@ -2,7 +2,6 @@ import os
 import json
 import base64
 import boto3
-import pandas as pd
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 
@@ -14,12 +13,17 @@ QUEUE_URL = os.environ["SQS_QUEUE_URL"]
 
 def get_json_secret(secret_id: str) -> dict:
     resp = secrets.get_secret_value(SecretId=secret_id)
+    if "SecretString" not in resp or not resp["SecretString"]:
+        raise ValueError(f"SecretString empty for secret: {secret_id}")
     return json.loads(resp["SecretString"])
 
 
 def get_private_key_der_from_sm() -> bytes:
     secret_id = os.environ["SNOWFLAKE_PRIVATE_KEY_SECRET_ID"]  # "snowflake_private_key"
     data = get_json_secret(secret_id)
+
+    if "snowflake_private_key_base64" not in data:
+        raise KeyError("Snowflake secret must contain JSON key: snowflake_private_key_base64")
 
     key_b64 = data["snowflake_private_key_base64"]
     key_bytes = base64.b64decode(key_b64)
@@ -45,7 +49,6 @@ def handler(event, context):
         private_key=get_private_key_der_from_sm(),
     )
 
-    # ✅ SAME SQL / SAME CONDITION as your original
     query = """
     SELECT 
         BRAND, 
@@ -55,17 +58,26 @@ def handler(event, context):
     LIMIT 7;
     """
 
-    df = pd.read_sql(query, conn)
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        rows = cur.fetchall()  # list of tuples
+    finally:
+        conn.close()
 
-    brands = df.to_dict(orient="records")
+    brands = []
+    for brand, entity_id in rows:
+        brands.append({"BRAND": brand, "ENTITY_ID": entity_id})
+
     print(f"✅ Found {len(brands)} brands. Pushing to SQS...")
 
+    sent = 0
     for brand in brands:
         sqs.send_message(
             QueueUrl=QUEUE_URL,
             MessageBody=json.dumps(brand),
         )
+        sent += 1
 
-    print(f"🚀 Successfully dispatched {len(brands)} messages to SQS.")
-    return {"status": "success", "count": len(brands)}
+    print(f"🚀 Successfully dispatched {sent} messages to SQS.")
+    return {"status": "success", "count": sent}
