@@ -2,7 +2,8 @@ import pulumi
 import pulumi_aws as aws
 import json
 
-# 1. Configuration & IAM Roles
+# 1. IAM Role for Lambda Execution
+# This role allows our functions to run, log to CloudWatch, and interact with SQS
 lambda_role = aws.iam.Role("google-trends-lambda-role",
     assume_role_policy=json.dumps({
         "Version": "2012-10-17",
@@ -14,7 +15,7 @@ lambda_role = aws.iam.Role("google-trends-lambda-role",
         }]
     }))
 
-# Permissions for CloudWatch Logs and SQS
+# Attach standard logging and SQS permissions
 aws.iam.RolePolicyAttachment("lambda-logs",
     role=lambda_role.name,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
@@ -23,11 +24,13 @@ aws.iam.RolePolicyAttachment("lambda-sqs",
     role=lambda_role.name,
     policy_arn="arn:aws:iam::aws:policy/AmazonSQSFullAccess")
 
-# 2. Create the SQS Queue
+# 2. SQS Queue
+# Bridge between Dispatcher and Worker. 15-minute visibility timeout.
 trends_queue = aws.sqs.Queue("google-trends-queue",
-    visibility_timeout_seconds=900) # Match 15-minute Lambda limit
+    visibility_timeout_seconds=900)
 
-# 3. Create the Dispatcher Lambda
+# 3. Dispatcher Lambda (The Postman)
+# handler="dispatcher.handler" tells AWS to look for handler() in dispatcher.py
 dispatcher_lambda = aws.lambda_.Function("trends-dispatcher",
     role=lambda_role.arn,
     runtime="python3.11",
@@ -46,7 +49,8 @@ dispatcher_lambda = aws.lambda_.Function("trends-dispatcher",
         }
     })
 
-# 4. Create the Worker Lambda
+# 4. Worker Lambda (The Engine)
+# handler="worker.handler" tells AWS to look for handler() in worker.py
 worker_lambda = aws.lambda_.Function("trends-worker",
     role=lambda_role.arn,
     runtime="python3.11",
@@ -68,13 +72,13 @@ worker_lambda = aws.lambda_.Function("trends-worker",
         }
     })
 
-# 5. Connect SQS to the Worker Lambda
+# 5. Connect SQS to the Worker
 aws.lambda_.EventSourceMapping("sqs-to-worker",
     event_source_arn=trends_queue.arn,
     function_name=worker_lambda.name,
-    batch_size=1) 
+    batch_size=1)
 
-# 6. Schedule (EventBridge Cron)
+# 6. Weekly Schedule Trigger (Mondays at 8 AM UTC)
 monday_trigger = aws.cloudwatch.EventRule("monday-8am-trigger",
     schedule_expression="cron(0 8 ? * MON *)")
 
@@ -88,6 +92,5 @@ aws.lambda_.Permission("allow-eventbridge",
     principal="events.amazonaws.com",
     source_arn=monday_trigger.arn)
 
-# 7. Outputs
-pulumi.export("queue_url", trends_queue.id)
+# Export names for manual invocation
 pulumi.export("dispatcher_name", dispatcher_lambda.name)
