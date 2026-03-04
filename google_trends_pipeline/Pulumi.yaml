@@ -1,0 +1,6 @@
+name: google-trends-pipeline
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+description: A serverless pipeline to fetch Google Trends data using SQS and AWS Lambda.
