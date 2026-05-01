@@ -1,0 +1,6 @@
+config:
+  aws:region: eu-west-2
+  shopify-graphql-pipeline:SHOPIFY_ACCESS_TOKEN:
+    secure: AAABACcr+Zzmhyh3GMhW8F6FmPIZFgFMLzfssK3qcLHxzo7eTSwh+1Y048RfNR1zGePkl5XFWIK5TZx6IqrYJAZOBwuBCw==
+  shopify-graphql-pipeline:CLIENT_ID: 03f6febc6958f84454fc3b64b12942fc
+  shopify-graphql-pipeline:SHOPIFY_CLIENT_ID: 03f6febc6958f84454fc3b64b12942fc

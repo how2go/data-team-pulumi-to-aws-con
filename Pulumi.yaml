@@ -1,0 +1,11 @@
+name: shopify-graphql-pipeline
+description: Supplementary pipeline for Shopify COGS and Attribution.
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python
