@@ -1,0 +1,11 @@
+name: label-extraction-pipeline
+description: Snowflake label extraction snapshot to S3 — runs daily at 06:00 UTC.
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python

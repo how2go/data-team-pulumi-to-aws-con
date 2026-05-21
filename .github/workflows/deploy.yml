@@ -1,0 +1,69 @@
+name: Deploy Label Extraction Pipeline
+
+# Runs automatically every time you push a commit to this branch.
+on:
+  push:
+    branches: [label-extraction-pipeline]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pull down the code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Set up the same Python version as the Lambda runtime
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Install the Pulumi CLI
+      - name: Install Pulumi CLI
+        run: |
+          curl -fsSL https://get.pulumi.com | sh
+          echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+
+      # 4. Create a virtualenv and install Pulumi Python SDK into it.
+      #    Pulumi.yaml points to virtualenv: venv, so Pulumi will use this env
+      #    when it runs __main__.py.
+      - name: Install Pulumi project dependencies
+        run: |
+          python -m venv venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install -r requirements.txt
+
+      # 5. Install the Lambda's Python dependencies into the Lambda source folder.
+      #    Pulumi zips ./src/label_extraction_lambda/ as-is, so the packages must
+      #    live there. We use --platform manylinux2014_x86_64 to guarantee the
+      #    binary wheels are compatible with Amazon Linux (Lambda's OS).
+      - name: Install Lambda dependencies
+        run: |
+          pip install \
+            --target src/label_extraction_lambda \
+            --requirement src/label_extraction_lambda/requirements.txt \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            --upgrade
+
+      # 6. Select the Pulumi stack (creates it on first run if it doesn't exist).
+      #    Stack lives in the healfz-org Pulumi Cloud organisation.
+      - name: Select or create Pulumi stack
+        run: pulumi stack select healfz-org/label-extraction-pipeline/dev --create
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+      # 7. Deploy — Pulumi diffs state and only touches what changed.
+      #    SNOWFLAKE_PRIVATE_KEY is read by __main__.py at deploy time and baked
+      #    into the Lambda's environment variables.
+      - name: Pulumi up
+        run: pulumi up --yes --skip-preview
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: eu-west-2
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
