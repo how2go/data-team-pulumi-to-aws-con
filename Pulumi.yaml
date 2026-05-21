@@ -1,4 +1,4 @@
-name: label-extraction-pipeline
+name: product-enrichment-pipeline
 description: Snowflake label extraction snapshot to S3 — runs daily at 06:00 UTC.
 runtime:
   name: python
