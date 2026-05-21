@@ -1,3 +1,2 @@
 snowflake-connector-python
-pandas
 cryptography

@@ -75,6 +75,7 @@ aws.iam.RolePolicy(
 # ---------------------------------------------------------------------------
 label_lambda = aws.lambda_.Function(
     "label-extraction-lambda",
+    name="product-enrichment",
     code=pulumi.AssetArchive({".": pulumi.FileArchive("./src/label_extraction_lambda")}),
     handler="handler.main",
     runtime="python3.11",

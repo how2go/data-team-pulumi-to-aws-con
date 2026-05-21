@@ -1,11 +1,11 @@
 import os
 import io
+import csv
 import logging
 import base64
 from datetime import datetime, timezone
 
 import boto3
-import pandas as pd
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 
@@ -59,11 +59,13 @@ def main(event, context):
         logger.info("No new variant id today")
         return {"statusCode": 200, "body": "No new variant id today"}
 
-    df = pd.DataFrame(rows, columns=columns)
-    logger.info("Fetched %d rows from %s", len(df), SOURCE_TABLE)
+    logger.info("Fetched %d rows from %s", len(rows), SOURCE_TABLE)
 
+    # Write CSV using stdlib — no pandas/numpy needed
     csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
+    writer = csv.writer(csv_buffer)
+    writer.writerow(columns)
+    writer.writerows(rows)
 
     bucket = os.environ["S3_BUCKET_NAME"]
     s3_key = f"edible/{folder_name}/enriched_variants.csv"
@@ -75,5 +77,5 @@ def main(event, context):
         ContentType="text/csv",
     )
 
-    logger.info("Uploaded %d rows to s3://%s/%s", len(df), bucket, s3_key)
-    return {"statusCode": 200, "body": f"Uploaded {len(df)} rows to s3://{bucket}/{s3_key}"}
+    logger.info("Uploaded %d rows to s3://%s/%s", len(rows), bucket, s3_key)
+    return {"statusCode": 200, "body": f"Uploaded {len(rows)} rows to s3://{bucket}/{s3_key}"}
