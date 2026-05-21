@@ -1,14 +1,14 @@
 """
-Label Extraction Pipeline — Pulumi infrastructure definition.
+Product Enrichment Pipeline — Pulumi infrastructure definition.
 
 Deploys one Lambda + one EventBridge rule:
-  - label-extraction-lambda
+  - product-enrichment (Lambda)
       Reads: healf.label_extraction.int_shopify_metadata__enriched_product_variants
       Writes: s3://shopify-products-metadata/edible/{YYYY-MM-DD_HH:MM:SS}/enriched_variants.csv
       Fires at 06:00 UTC daily via EventBridge.
       If the source table is empty, nothing is written to S3.
 
-Deploy: push to the label-extraction-pipeline branch — GitHub Actions runs pulumi up.
+Deploy: run pulumi up from the product-enrichment-pipeline branch.
 """
 
 import os
@@ -19,16 +19,14 @@ import pulumi_aws as aws
 BUCKET_NAME = "shopify-products-metadata"
 SCHEDULE = "cron(0 6 * * ? *)"  # 06:00 UTC daily
 
-# Snowflake private key is injected by GitHub Actions as an env var at deploy time.
-# The value is stored as a GitHub secret (SNOWFLAKE_PRIVATE_KEY) and passed to the
-# Lambda's environment so it never touches the Pulumi state in plain text.
 snowflake_private_key = os.environ.get("SNOWFLAKE_PRIVATE_KEY", "")
 
 # ---------------------------------------------------------------------------
 # IAM role for the Lambda
 # ---------------------------------------------------------------------------
 role = aws.iam.Role(
-    "label-extraction-role",
+    "product-enrichment-role",
+    name="product-enrichment-role",
     assume_role_policy=json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
@@ -40,7 +38,8 @@ role = aws.iam.Role(
 )
 
 aws.iam.RolePolicy(
-    "label-extraction-policy",
+    "product-enrichment-policy",
+    name="product-enrichment-policy",
     role=role.id,
     policy=json.dumps({
         "Version": "2012-10-17",
@@ -72,24 +71,25 @@ aws.iam.RolePolicy(
 
 # ---------------------------------------------------------------------------
 # Lambda function
+# CloudWatch logs will appear at: /aws/lambda/product-enrichment
 # ---------------------------------------------------------------------------
 label_lambda = aws.lambda_.Function(
-    "label-extraction-lambda",
+    "product-enrichment-lambda",
     name="product-enrichment",
     code=pulumi.AssetArchive({".": pulumi.FileArchive("./src/label_extraction_lambda")}),
     handler="handler.main",
     runtime="python3.11",
     role=role.arn,
-    timeout=300,       # 5 minutes max; data transfer should complete in ~2 min
+    timeout=300,
     memory_size=512,
     environment={"variables": {
-        "SNOWFLAKE_USER":      "SJ_SERVICE_USER",
-        "SNOWFLAKE_ACCOUNT":   "GWNDCGK-GN77379",
-        "SNOWFLAKE_WAREHOUSE": "HEALF_WH",
-        "SNOWFLAKE_DATABASE":  "HEALF",
-        "SNOWFLAKE_SCHEMA":    "label_extraction",
-        "SNOWFLAKE_ROLE":      "PC_THOUGHTSPOT_ROLE",
-        "S3_BUCKET_NAME":      BUCKET_NAME,
+        "SNOWFLAKE_USER":        "SJ_SERVICE_USER",
+        "SNOWFLAKE_ACCOUNT":     "GWNDCGK-GN77379",
+        "SNOWFLAKE_WAREHOUSE":   "HEALF_WH",
+        "SNOWFLAKE_DATABASE":    "HEALF",
+        "SNOWFLAKE_SCHEMA":      "label_extraction",
+        "SNOWFLAKE_ROLE":        "PC_THOUGHTSPOT_ROLE",
+        "S3_BUCKET_NAME":        BUCKET_NAME,
         "SNOWFLAKE_PRIVATE_KEY": snowflake_private_key,
     }},
 )
@@ -98,19 +98,20 @@ label_lambda = aws.lambda_.Function(
 # EventBridge rule — fires at 06:00 UTC every day
 # ---------------------------------------------------------------------------
 event_rule = aws.cloudwatch.EventRule(
-    "label-extraction-daily",
+    "product-enrichment-schedule",
+    name="product-enrichment-schedule",
     schedule_expression=SCHEDULE,
-    description="Fires the label extraction Lambda at 06:00 UTC daily.",
+    description="Fires the product-enrichment Lambda at 06:00 UTC daily.",
 )
 
 aws.cloudwatch.EventTarget(
-    "label-extraction-target",
+    "product-enrichment-target",
     rule=event_rule.name,
     arn=label_lambda.arn,
 )
 
 aws.lambda_.Permission(
-    "label-extraction-perm",
+    "product-enrichment-perm",
     action="lambda:InvokeFunction",
     function=label_lambda.name,
     principal="events.amazonaws.com",
