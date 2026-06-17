@@ -1,0 +1,11 @@
+name: crm-profile-klaviyo-pipeline
+description: Snowflake CRM profile (Klaviyo mart) daily snapshot to S3 — runs daily at 08:00 UTC.
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python
