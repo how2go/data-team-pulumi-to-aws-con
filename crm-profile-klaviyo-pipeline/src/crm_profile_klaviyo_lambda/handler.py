@@ -40,6 +40,8 @@ def _get_snowflake_connection():
         "database": os.environ["SNOWFLAKE_DATABASE"],
         "schema": os.environ["SNOWFLAKE_SCHEMA"],
         "private_key": _get_private_key_bytes(),
+        "ocsp_fail_open": True,   # don't hang if OCSP cert-check times out (common in Lambda)
+        "login_timeout": 60,      # fail fast with a clear error instead of hanging 15 min
     }
     role = os.environ.get("SNOWFLAKE_ROLE")
     if role:
