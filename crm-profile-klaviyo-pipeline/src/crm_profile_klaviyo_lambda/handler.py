@@ -12,13 +12,10 @@ from cryptography.hazmat.primitives import serialization
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Source: full snapshot of the CRM profile mart, ordered by customer id.
 SOURCE_TABLE = "healf.healf_bi.mart_crm_profile_klaviyo"
 ORDER_BY_COLUMN = "CUSTOMER_ID"
-
-# Destination layout: s3://<bucket>/crm-customers/<YYYY-MM-DD>/file_<N>.csv
 S3_PREFIX = "crm-customers"
-DEFAULT_BATCH_SIZE = 100_000
+DEFAULT_BATCH_SIZE = 50_000
 
 
 def _get_private_key_bytes() -> bytes:
@@ -40,8 +37,8 @@ def _get_snowflake_connection():
         "database": os.environ["SNOWFLAKE_DATABASE"],
         "schema": os.environ["SNOWFLAKE_SCHEMA"],
         "private_key": _get_private_key_bytes(),
-        "ocsp_fail_open": True,   # don't hang if OCSP cert-check times out (common in Lambda)
-        "login_timeout": 60,      # fail fast with a clear error instead of hanging 15 min
+        "ocsp_fail_open": True,  # don't hang if OCSP cert-check times out in Lambda
+        "login_timeout": 60,     # fail fast with a clear error instead of silent hang
     }
     role = os.environ.get("SNOWFLAKE_ROLE")
     if role:
@@ -50,12 +47,6 @@ def _get_snowflake_connection():
 
 
 def _ensure_prefix_exists(s3_client, bucket, prefix):
-    """Make sure the `crm-customers/` folder exists; create a marker if it doesn't.
-
-    S3 has no real folders — a prefix only "exists" once an object lives under it.
-    We check for anything under the prefix and, if empty, write a zero-byte folder
-    marker so the folder is present/visible even before the first run's files land.
-    """
     folder_key = prefix if prefix.endswith("/") else prefix + "/"
     resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=folder_key, MaxKeys=1)
     if resp.get("KeyCount", 0) == 0:
@@ -66,12 +57,6 @@ def _ensure_prefix_exists(s3_client, bucket, prefix):
 
 
 def _write_batch_to_s3(s3_client, bucket, key, columns, rows, loaded_at):
-    """Serialize one batch to CSV (with header) and upload it as a single object.
-
-    Appends a `loaded_at` column to every row with the Lambda run timestamp (UTC).
-    All rows in a run share the same value so you can always trace which export
-    produced a given row.
-    """
     columns_with_ts = list(columns) + ["loaded_at"]
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -87,10 +72,9 @@ def _write_batch_to_s3(s3_client, bucket, key, columns, rows, loaded_at):
 
 
 def main(event, context):
-    # Date partition + all timestamps are UTC.
     run_utc = datetime.now(timezone.utc)
     date_folder = run_utc.strftime("%Y-%m-%d")
-    loaded_at = run_utc.strftime("%Y-%m-%d %H:%M:%S")  # e.g. 2026-06-17 08:00:00
+    loaded_at = run_utc.strftime("%Y-%m-%d %H:%M:%S")
 
     bucket = os.environ["S3_BUCKET_NAME"]
     batch_size = int(os.environ.get("BATCH_SIZE", DEFAULT_BATCH_SIZE))
@@ -101,35 +85,44 @@ def main(event, context):
     )
 
     s3_client = boto3.client("s3")
-
-    # Ensure the crm-customers/ folder exists before we start writing into it.
     _ensure_prefix_exists(s3_client, bucket, S3_PREFIX)
 
     conn = _get_snowflake_connection()
+    logger.info("Snowflake connection established")
 
     total_rows = 0
     file_index = 0
+    last_customer_id = -1  # keyset pagination cursor
+
     try:
         with conn.cursor() as cur:
-            # Render every TIMESTAMP/DATE column in UTC regardless of its stored tz.
             cur.execute("ALTER SESSION SET TIMEZONE = 'UTC'")
 
-            cur.execute(f"SELECT * FROM {SOURCE_TABLE} ORDER BY {ORDER_BY_COLUMN} ASC")
-            columns = [c[0] for c in cur.description]
-
-            # Stream the result set in customer_id order, one file per batch,
-            # so memory stays bounded even for very large tables.
+            # Keyset pagination: each query fetches only `batch_size` rows starting
+            # after the last CUSTOMER_ID we saw. This keeps Lambda memory flat
+            # regardless of total table size — we never load the full table at once.
             while True:
-                rows = cur.fetchmany(batch_size)
+                cur.execute(
+                    f"SELECT * FROM {SOURCE_TABLE} "
+                    f"WHERE {ORDER_BY_COLUMN} > %s "
+                    f"ORDER BY {ORDER_BY_COLUMN} ASC "
+                    f"LIMIT %s",
+                    (last_customer_id, batch_size),
+                )
+                columns = [c[0] for c in cur.description]
+                rows = cur.fetchall()
+
                 if not rows:
                     break
+
+                last_customer_id = rows[-1][0]  # CUSTOMER_ID is first column
                 file_index += 1
                 key = f"{S3_PREFIX}/{date_folder}/file_{file_index}.csv"
                 _write_batch_to_s3(s3_client, bucket, key, columns, rows, loaded_at)
                 total_rows += len(rows)
                 logger.info(
-                    "Wrote %d rows to s3://%s/%s (cumulative %d)",
-                    len(rows), bucket, key, total_rows,
+                    "file_%d: wrote %d rows (last customer_id=%s, cumulative=%d)",
+                    file_index, len(rows), last_customer_id, total_rows,
                 )
     finally:
         conn.close()

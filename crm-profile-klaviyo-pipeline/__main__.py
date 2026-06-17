@@ -26,7 +26,7 @@ import pulumi_aws as aws
 BUCKET_NAME = "engineering-s3-data-share"
 S3_PREFIX = "crm-customers"
 SCHEDULE = "cron(0 8 * * ? *)"  # 08:00 UTC daily
-BATCH_SIZE = "100000"
+BATCH_SIZE = "50000"
 
 snowflake_private_key = os.environ.get("SNOWFLAKE_PRIVATE_KEY", "")
 
@@ -89,8 +89,8 @@ crm_lambda = aws.lambda_.Function(
     handler="handler.main",
     runtime="python3.11",
     role=role.arn,
-    timeout=900,        # 15 min (Lambda max) — full-table export can be long
-    memory_size=2048,   # headroom for buffering a 100k-row CSV batch in memory
+    timeout=900,        # 15 min (Lambda max)
+    memory_size=4096,   # 4 GB — keyset pagination keeps memory flat, but headroom helps
     environment={"variables": {
         "SNOWFLAKE_USER":        "SJ_SERVICE_USER",
         "SNOWFLAKE_ACCOUNT":     "GWNDCGK-GN77379",
