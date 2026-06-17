@@ -63,12 +63,19 @@ def _ensure_prefix_exists(s3_client, bucket, prefix):
         logger.info("Folder s3://%s/%s already exists", bucket, folder_key)
 
 
-def _write_batch_to_s3(s3_client, bucket, key, columns, rows):
-    """Serialize one batch to CSV (with header) and upload it as a single object."""
+def _write_batch_to_s3(s3_client, bucket, key, columns, rows, loaded_at):
+    """Serialize one batch to CSV (with header) and upload it as a single object.
+
+    Appends a `loaded_at` column to every row with the Lambda run timestamp (UTC).
+    All rows in a run share the same value so you can always trace which export
+    produced a given row.
+    """
+    columns_with_ts = list(columns) + ["loaded_at"]
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(columns)
-    writer.writerows(rows)
+    writer.writerow(columns_with_ts)
+    for row in rows:
+        writer.writerow(list(row) + [loaded_at])
     s3_client.put_object(
         Bucket=bucket,
         Key=key,
@@ -81,6 +88,7 @@ def main(event, context):
     # Date partition + all timestamps are UTC.
     run_utc = datetime.now(timezone.utc)
     date_folder = run_utc.strftime("%Y-%m-%d")
+    loaded_at = run_utc.strftime("%Y-%m-%d %H:%M:%S")  # e.g. 2026-06-17 08:00:00
 
     bucket = os.environ["S3_BUCKET_NAME"]
     batch_size = int(os.environ.get("BATCH_SIZE", DEFAULT_BATCH_SIZE))
@@ -115,7 +123,7 @@ def main(event, context):
                     break
                 file_index += 1
                 key = f"{S3_PREFIX}/{date_folder}/file_{file_index}.csv"
-                _write_batch_to_s3(s3_client, bucket, key, columns, rows)
+                _write_batch_to_s3(s3_client, bucket, key, columns, rows, loaded_at)
                 total_rows += len(rows)
                 logger.info(
                     "Wrote %d rows to s3://%s/%s (cumulative %d)",

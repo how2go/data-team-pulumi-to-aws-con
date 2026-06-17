@@ -2,7 +2,7 @@
 CRM Profile (Klaviyo mart) Pipeline — Pulumi infrastructure definition.
 
 Deploys one Lambda + one EventBridge rule into the DATA-TEAM account (051826722213):
-  - crm-profile-klaviyo-export (Lambda)
+  - crm-klaviyo-export (Lambda)
       Reads the full snapshot of:
         healf.healf_bi.mart_crm_profile_klaviyo   (ordered by CUSTOMER_ID ASC)
       Writes, in 100k-row batches:
@@ -34,8 +34,8 @@ snowflake_private_key = os.environ.get("SNOWFLAKE_PRIVATE_KEY", "")
 # IAM role for the Lambda
 # ---------------------------------------------------------------------------
 role = aws.iam.Role(
-    "crm-profile-klaviyo-role",
-    name="crm-profile-klaviyo-role",
+    "crm-klaviyo-role",
+    name="crm-klaviyo-role",
     assume_role_policy=json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
@@ -47,8 +47,8 @@ role = aws.iam.Role(
 )
 
 aws.iam.RolePolicy(
-    "crm-profile-klaviyo-policy",
-    name="crm-profile-klaviyo-policy",
+    "crm-klaviyo-policy",
+    name="crm-klaviyo-policy",
     role=role.id,
     policy=json.dumps({
         "Version": "2012-10-17",
@@ -80,11 +80,11 @@ aws.iam.RolePolicy(
 
 # ---------------------------------------------------------------------------
 # Lambda function
-# CloudWatch logs will appear at: /aws/lambda/crm-profile-klaviyo-export
+# CloudWatch logs will appear at: /aws/lambda/crm-klaviyo-export
 # ---------------------------------------------------------------------------
 crm_lambda = aws.lambda_.Function(
-    "crm-profile-klaviyo-lambda",
-    name="crm-profile-klaviyo-export",
+    "crm-klaviyo-lambda",
+    name="crm-klaviyo-export",
     code=pulumi.AssetArchive({".": pulumi.FileArchive("./src/crm_profile_klaviyo_lambda")}),
     handler="handler.main",
     runtime="python3.11",
@@ -108,20 +108,20 @@ crm_lambda = aws.lambda_.Function(
 # EventBridge rule — fires at 08:00 UTC every day
 # ---------------------------------------------------------------------------
 event_rule = aws.cloudwatch.EventRule(
-    "crm-profile-klaviyo-schedule",
-    name="crm-profile-klaviyo-schedule",
+    "crm-klaviyo-schedule",
+    name="crm-klaviyo-schedule",
     schedule_expression=SCHEDULE,
-    description="Fires the crm-profile-klaviyo-export Lambda at 08:00 UTC daily.",
+    description="Fires the crm-klaviyo-export Lambda at 08:00 UTC daily.",
 )
 
 aws.cloudwatch.EventTarget(
-    "crm-profile-klaviyo-target",
+    "crm-klaviyo-target",
     rule=event_rule.name,
     arn=crm_lambda.arn,
 )
 
 aws.lambda_.Permission(
-    "crm-profile-klaviyo-perm",
+    "crm-klaviyo-perm",
     action="lambda:InvokeFunction",
     function=crm_lambda.name,
     principal="events.amazonaws.com",
