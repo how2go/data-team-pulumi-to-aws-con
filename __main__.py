@@ -81,7 +81,7 @@ label_lambda = aws.lambda_.Function(
     runtime="python3.11",
     role=role.arn,
     timeout=300,
-    memory_size=512,
+    memory_size=700,
     environment={"variables": {
         "SNOWFLAKE_USER":        "SJ_SERVICE_USER",
         "SNOWFLAKE_ACCOUNT":     "GWNDCGK-GN77379",
