@@ -69,6 +69,7 @@ TABLES = [
         "table": f"{DB_SCHEMA}.mart_variant_ingredient_lookup",
         "s3_folder": "ingredient_lookup_edible",
         "filename": "ingredient_lookup_edible.csv",
+        "inject_date": True,
     },
 ]
 
@@ -99,7 +100,7 @@ def _get_snowflake_connection():
     return snowflake.connector.connect(**kwargs)
 
 
-def _fetch_and_upload(cur, s3_client, bucket, folder_name, table_cfg):
+def _fetch_and_upload(cur, s3_client, bucket, folder_name, table_cfg, run_date):
     table = table_cfg["table"]
     s3_key = f"{table_cfg['s3_folder']}/{folder_name}/{table_cfg['filename']}"
 
@@ -110,6 +111,10 @@ def _fetch_and_upload(cur, s3_client, bucket, folder_name, table_cfg):
     if not rows:
         logger.info("No rows in %s — skipping upload", table)
         return 0
+
+    if table_cfg.get("inject_date"):
+        columns = list(columns) + ["INJECTED_DATE"]
+        rows = [tuple(row) + (run_date,) for row in rows]
 
     csv_buffer = io.StringIO()
     writer = csv.writer(csv_buffer)
@@ -134,13 +139,14 @@ def main(event, context):
 
     bucket = os.environ["S3_BUCKET_NAME"]
     s3_client = boto3.client("s3")
+    run_date = utc_now.strftime("%Y-%m-%d")
 
     conn = _get_snowflake_connection()
     results = []
     try:
         with conn.cursor() as cur:
             for table_cfg in TABLES:
-                count = _fetch_and_upload(cur, s3_client, bucket, folder_name, table_cfg)
+                count = _fetch_and_upload(cur, s3_client, bucket, folder_name, table_cfg, run_date)
                 results.append({"table": table_cfg["s3_folder"], "rows": count})
     finally:
         conn.close()
