@@ -3,18 +3,6 @@
 #
 from __future__ import annotations
 
-
-# start delvewheel patch
-def _delvewheel_patch_1_12_1():
-    import os
-    if os.path.isdir(libs_dir := os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'snowflake_connector_python.libs'))):
-        os.add_dll_directory(libs_dir)
-
-
-_delvewheel_patch_1_12_1()
-del _delvewheel_patch_1_12_1
-# end delvewheel patch
-
 from functools import wraps
 
 from ._utils import _core_loader
