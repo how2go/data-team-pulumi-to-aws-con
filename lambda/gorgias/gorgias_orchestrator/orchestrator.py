@@ -33,7 +33,7 @@ ORCHESTRATOR_RULE_NAME = os.environ.get("ORCHESTRATOR_RULE_NAME", "").strip()
 # -------------------- Schedule Configuration --------------------
 SCHEDULE_CONFIG = {
     "customers": {"start_hour": 2, "days_back": 1},
-    "tickets":   {"start_hour": 3, "days_back": 1},
+    "tickets":   {"frequency": "hourly", "days_back": 0},
     "messages":  {"frequency": "hourly", "days_back": 0},
     "satisfaction_surveys": {"start_hour": 5, "days_back": 1},
     "users":     {"start_hour": 6, "days_back": 1},
